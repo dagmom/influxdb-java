@@ -1,10 +1,26 @@
 # Changelog
 
-## 2.16
+## 2.19 [unreleased]
+
+## 2.18 [2020-04-17]
+
+### Fixes
+
+- Update to okhttp 4.x [PR #644](https://github.com/influxdata/influxdb-java/pull/644)
+
+## 2.17 [2019-12-06]
+
+### Fixes
+
+- Fixed runtime exception propagation in chunked query [Issue #639](https://github.com/influxdata/influxdb-java/issues/639)
+
+## 2.16 [2019-10-25]
 
 ### Fixes
 
 - Add new annotation called TimeColumn for timestamp field in POJO bean, this can set Point time and precision field correctly, also avoid UnableToParseException when flush Point to influx.
+- Skip fields with NaN and infinity values when writing to InfluxDB
+  [Issue #614](https://github.com/influxdata/influxdb-java/issues/614)
 
 ## 2.15 [2019-02-22]
 
@@ -29,6 +45,8 @@ OkHttpClient client = new OkHttpClient.Builder()
   [Issue #367](https://github.com/influxdata/influxdb-java/issues/367)
 - BatchOptions to have .precision()
   [Issue #532](https://github.com/influxdata/influxdb-java/issues/532)
+- Point.Builder.addFieldsFromPOJO to add Column fields from super class
+  [Issue #613](https://github.com/influxdata/influxdb-java/issues/613)
 
 ## 2.14 [2018-10-12]
 

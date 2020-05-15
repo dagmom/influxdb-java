@@ -4,6 +4,7 @@ import java.lang.annotation.Annotation;
 import java.lang.reflect.Field;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.RoundingMode;
 import java.text.NumberFormat;
 import java.time.Instant;
 import java.util.Locale;
@@ -28,7 +29,7 @@ import org.influxdb.impl.Preconditions;
 public class Point {
   private String measurement;
   private Map<String, String> tags;
-  private Long time;
+  private Number time;
   private TimeUnit precision = TimeUnit.NANOSECONDS;
   private Map<String, Object> fields;
   private static final int MAX_FRACTION_DIGITS = 340;
@@ -89,9 +90,10 @@ public class Point {
    *
    */
   public static final class Builder {
+    private static final BigInteger NANOSECONDS_PER_SECOND = BigInteger.valueOf(1000000000L);
     private final String measurement;
     private final Map<String, String> tags = new TreeMap<>();
-    private Long time;
+    private Number time;
     private TimeUnit precision;
     private final Map<String, Object> fields = new TreeMap<>();
 
@@ -178,6 +180,21 @@ public class Point {
       return this;
     }
 
+    public Builder addField(final String field, final int value) {
+      fields.put(field, value);
+      return this;
+    }
+
+    public Builder addField(final String field, final float value) {
+      fields.put(field, value);
+      return this;
+    }
+
+    public Builder addField(final String field, final short value) {
+      fields.put(field, value);
+      return this;
+    }
+
     public Builder addField(final String field, final Number value) {
       fields.put(field, value);
       return this;
@@ -205,15 +222,28 @@ public class Point {
     /**
      * Add a time to this point.
      *
-     * @param timeToSet the time for this point
+     * @param timeToSet      the time for this point
      * @param precisionToSet the TimeUnit
      * @return the Builder instance.
      */
-    public Builder time(final long timeToSet, final TimeUnit precisionToSet) {
+    public Builder time(final Number timeToSet, final TimeUnit precisionToSet) {
+      Objects.requireNonNull(timeToSet, "timeToSet");
       Objects.requireNonNull(precisionToSet, "precisionToSet");
       this.time = timeToSet;
       this.precision = precisionToSet;
       return this;
+    }
+
+    /**
+     * Add a time to this point as Long.
+     * only kept for binary compatibility with previous releases.
+     *
+     * @param timeToSet      the time for this point as Long
+     * @param precisionToSet the TimeUnit
+     * @return the Builder instance.
+     */
+    public Builder time(final Long timeToSet, final TimeUnit precisionToSet) {
+      return time((Number) timeToSet, precisionToSet);
     }
 
     /**
@@ -235,19 +265,22 @@ public class Point {
     public Builder addFieldsFromPOJO(final Object pojo) {
 
       Class<? extends Object> clazz = pojo.getClass();
+      while (clazz != null) {
 
-      for (Field field : clazz.getDeclaredFields()) {
+        for (Field field : clazz.getDeclaredFields()) {
 
-        Column column = field.getAnnotation(Column.class);
+          Column column = field.getAnnotation(Column.class);
 
-        if (column == null) {
-          continue;
+          if (column == null) {
+            continue;
+          }
+
+          field.setAccessible(true);
+          String fieldName = column.name();
+          addFieldByAttribute(pojo, field, column, fieldName);
         }
-
-        field.setAccessible(true);
-        String fieldName = column.name();
-        addFieldByAttribute(pojo, field, column, fieldName);
-      }
+      clazz = clazz.getSuperclass();
+    }
 
       if (this.fields.isEmpty()) {
         throw new BuilderException("Class " + pojo.getClass().getName()
@@ -265,17 +298,29 @@ public class Point {
         TimeColumn tc = field.getAnnotation(TimeColumn.class);
         if (tc != null && Instant.class.isAssignableFrom(field.getType())) {
           Optional.ofNullable((Instant) fieldValue).ifPresent(instant -> {
-            TimeUnit timeUint = tc.timeUnit();
-            this.time = TimeUnit.MILLISECONDS.convert(instant.toEpochMilli(), timeUint);
-            this.precision = timeUint;
+            TimeUnit timeUnit = tc.timeUnit();
+            if (timeUnit == TimeUnit.NANOSECONDS || timeUnit == TimeUnit.MICROSECONDS) {
+              this.time = BigInteger.valueOf(instant.getEpochSecond())
+                                    .multiply(NANOSECONDS_PER_SECOND)
+                                    .add(BigInteger.valueOf(instant.getNano()))
+                                    .divide(BigInteger.valueOf(TimeUnit.NANOSECONDS.convert(1, timeUnit)));
+            } else {
+              this.time = TimeUnit.MILLISECONDS.convert(instant.toEpochMilli(), timeUnit);
+              this.precision = timeUnit;
+            }
+            this.precision = timeUnit;
           });
           return;
         }
 
         if (column.tag()) {
-          this.tags.put(fieldName, (String) fieldValue);
+          if (fieldValue != null) {
+            this.tags.put(fieldName, (String) fieldValue);
+          }
         } else {
-          this.fields.put(fieldName, fieldValue);
+          if (fieldValue != null) {
+            this.fields.put(fieldName, fieldValue);
+          }
         }
 
       } catch (IllegalArgumentException | IllegalAccessException e) {
@@ -317,7 +362,7 @@ public class Point {
    * @param time
    *            the time to set
    */
-  void setTime(final Long time) {
+  void setTime(final Number time) {
     this.time = time;
   }
 
@@ -405,13 +450,15 @@ public class Point {
   }
 
   /**
-   * calculate the lineprotocol entry for a single Point.
+   * Calculate the lineprotocol entry for a single Point.
+   * <p>
+   * NaN and infinity values are silently dropped as they are unsupported:
+   * https://github.com/influxdata/influxdb/issues/4089
    *
-   * Documentation is WIP : https://github.com/influxdb/influxdb/pull/2997
+   * @see <a href="https://docs.influxdata.com/influxdb/v1.7/write_protocols/line_protocol_reference/">
+   *     InfluxDB line protocol reference</a>
    *
-   * https://github.com/influxdb/influxdb/blob/master/tsdb/README.md
-   *
-   * @return the String without newLine.
+   * @return the String without newLine, empty when there are no fields to write
    */
   public String lineProtocol() {
     return lineProtocol(null);
@@ -419,8 +466,15 @@ public class Point {
 
   /**
    * Calculate the lineprotocol entry for a single point, using a specific {@link TimeUnit} for the timestamp.
+   * <p>
+   * NaN and infinity values are silently dropped as they are unsupported:
+   * https://github.com/influxdata/influxdb/issues/4089
+   *
+   * @see <a href="https://docs.influxdata.com/influxdb/v1.7/write_protocols/line_protocol_reference/">
+   *     InfluxDB line protocol reference</a>
+   *
    * @param precision the time precision unit for this point
-   * @return the String without newLine
+   * @return the String without newLine, empty when there are no fields to write
    */
   public String lineProtocol(final TimeUnit precision) {
 
@@ -431,7 +485,10 @@ public class Point {
 
     escapeKey(sb, measurement);
     concatenatedTags(sb);
-    concatenatedFields(sb);
+    int writtenFields = concatenatedFields(sb);
+    if (writtenFields == 0) {
+      return "";
+    }
     formatedTime(sb, precision);
 
     return sb.toString();
@@ -447,10 +504,11 @@ public class Point {
     sb.append(' ');
   }
 
-  private void concatenatedFields(final StringBuilder sb) {
+  private int concatenatedFields(final StringBuilder sb) {
+    int fieldCount = 0;
     for (Entry<String, Object> field : this.fields.entrySet()) {
       Object value = field.getValue();
-      if (value == null) {
+      if (value == null || isNotFinite(value)) {
         continue;
       }
       escapeKey(sb, field.getKey());
@@ -471,6 +529,8 @@ public class Point {
       }
 
       sb.append(',');
+
+      fieldCount++;
     }
 
     // efficiently chop off the trailing comma
@@ -478,6 +538,8 @@ public class Point {
     if (sb.charAt(lengthMinusOne) == ',') {
       sb.setLength(lengthMinusOne);
     }
+
+    return fieldCount;
   }
 
   static void escapeKey(final StringBuilder sb, final String key) {
@@ -505,16 +567,45 @@ public class Point {
     }
   }
 
+  private static boolean isNotFinite(final Object value) {
+    return value instanceof Double && !Double.isFinite((Double) value)
+            || value instanceof Float && !Float.isFinite((Float) value);
+  }
+
   private void formatedTime(final StringBuilder sb, final TimeUnit precision) {
     if (this.time == null) {
       return;
     }
-    if (precision == null) {
-      sb.append(" ").append(TimeUnit.NANOSECONDS.convert(this.time, this.precision));
-      return;
+    TimeUnit converterPrecision = precision;
+
+    if (converterPrecision == null) {
+      converterPrecision = TimeUnit.NANOSECONDS;
     }
-    sb.append(" ").append(precision.convert(this.time, this.precision));
+    if (this.time instanceof BigInteger) {
+      BigInteger time = (BigInteger) this.time;
+      long conversionFactor = converterPrecision.convert(1, this.precision);
+      if (conversionFactor >= 1) {
+        time = time.multiply(BigInteger.valueOf(conversionFactor));
+      } else {
+        conversionFactor = this.precision.convert(1, converterPrecision);
+        time = time.divide(BigInteger.valueOf(conversionFactor));
+      }
+      sb.append(" ").append(time);
+    } else if (this.time instanceof BigDecimal) {
+      BigDecimal time = (BigDecimal) this.time;
+      long conversionFactor = converterPrecision.convert(1, this.precision);
+      if (conversionFactor >= 1) {
+        time = time.multiply(BigDecimal.valueOf(conversionFactor));
+      } else {
+        conversionFactor = this.precision.convert(1, converterPrecision);
+        time = time.divide(BigDecimal.valueOf(conversionFactor), RoundingMode.HALF_UP);
+      }
+      sb.append(" ").append(time.toBigInteger());
+    } else {
+      sb.append(" ").append(converterPrecision.convert(this.time.longValue(), this.precision));
+    }
   }
+
 
   private static String findMeasurementName(final Class<?> clazz) {
     return clazz.getAnnotation(Measurement.class).name();
